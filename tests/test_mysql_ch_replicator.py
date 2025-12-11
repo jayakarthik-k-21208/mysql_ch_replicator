@@ -130,6 +130,105 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     db_replicator_runner.stop()
 
 
+def test_realtime_only_without_state():
+    """
+    Test that --realtime_only works without requiring a pre-existing state file.
+    This tests the stateless realtime sync capability:
+    1. Run initial replication normally (creates ClickHouse tables)
+    2. Delete the state file (simulating loss of state)
+    3. Run with --realtime_only=True and verify it can pick up new changes
+    """
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    # Create table and insert initial data
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+); 
+    ''')
+
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Alice', 30);", commit=True)
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Bob', 25);", commit=True)
+
+    # Start binlog replicator first (needed to capture binlog position)
+    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner.run()
+    
+    time.sleep(2)  # Give binlog replicator time to start
+
+    # Run initial replication (this creates the ClickHouse tables)
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME, 
+        additional_arguments='--initial_only=True'
+    )
+    db_replicator_runner.run()
+    db_replicator_runner.wait_complete()
+
+    assert TEST_DB_NAME in ch.get_databases()
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert TEST_TABLE_NAME in ch.get_tables()
+    assert len(ch.select(TEST_TABLE_NAME)) == 2
+
+    db_replicator_runner.stop()
+
+    # Delete the state file to simulate "state lost" scenario
+    state_file_path = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME, 'state.pckl')
+    if os.path.exists(state_file_path):
+        os.remove(state_file_path)
+    
+    # Verify state file is gone
+    assert not os.path.exists(state_file_path), "State file should be deleted"
+
+    # Insert more data into MySQL AFTER initial replication finished
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Charlie', 35);", commit=True)
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Diana', 28);", commit=True)
+
+    # Now run with --realtime_only=True WITHOUT a state file
+    # This should work - it will fetch table structures from MySQL and start from current binlog position
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME, 
+        additional_arguments='--realtime_only=True'
+    )
+    db_replicator_runner.run()
+
+    # Wait for the new records to be replicated
+    # Note: Since we deleted state, it starts from current binlog position
+    # The records inserted before starting realtime_only should be captured
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 4, max_wait_time=30)
+
+    # Verify all records including new ones
+    records = ch.select(TEST_TABLE_NAME)
+    names = {r['name'] for r in records}
+    assert names == {'Alice', 'Bob', 'Charlie', 'Diana'}, f"Expected all 4 names, got {names}"
+
+    # Insert another record to verify realtime sync is working
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Eve', 22);", commit=True)
+    
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5, max_wait_time=30)
+
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+    assert_wait(lambda: 'stopping db_replicator' in read_logs(TEST_DB_NAME))
+    assert 'Traceback' not in read_logs(TEST_DB_NAME)
+
+
 def test_parallel_initial_replication_record_versions():
     """
     Test that record versions are properly consolidated from worker states

@@ -108,6 +108,7 @@ def run_db_replicator(args, config: Settings):
         database=db_name,
         target_database=getattr(args, 'target_db', None),
         initial_only=args.initial_only,
+        realtime_only=getattr(args, 'realtime_only', False),
         worker_id=args.worker_id,
         total_workers=args.total_workers,
         table=args.table,
@@ -170,6 +171,10 @@ def main():
     parser.add_argument(
         "--initial_only", type=bool, default=False,
         help="don't run realtime replication, run initial replication only",
+    )
+    parser.add_argument(
+        "--realtime_only", type=bool, default=False,
+        help="skip initial replication and run realtime replication only (assumes ClickHouse tables already exist)",
     )
     parser.add_argument(
         "--worker_id", type=int, default=None,

@@ -88,6 +88,7 @@ class State:
 
 class DbReplicator:
     def __init__(self, config: Settings, database: str, target_database: str = None, initial_only: bool = False, 
+                 realtime_only: bool = False,
                  worker_id: int = None, total_workers: int = None, table: str = None, initial_replication_test_fail_records: int = None):
         self.config = config
         self.database = database
@@ -96,6 +97,7 @@ class DbReplicator:
         self.settings_file = config.settings_file
         self.single_table = table  # Store the single table to process
         self.initial_replication_test_fail_records = initial_replication_test_fail_records  # Test flag for early exit
+        self.realtime_only = realtime_only  # Whether to skip initial replication and go straight to realtime
         
         # use same as source database by default
         self.target_database = database
@@ -188,6 +190,92 @@ class DbReplicator:
     def get_target_table_name(self, source_table: str) -> str:
         return self.config.get_target_table_name(self.database, source_table)
 
+    def _initialize_for_realtime_only(self):
+        """
+        Initialize state for realtime-only mode without requiring prior initial replication.
+        Assumes ClickHouse database and tables already exist with correct structure.
+        Fetches table structures from MySQL for record conversion.
+        Works without requiring a pre-existing state file.
+        """
+        logger.info('initializing for realtime-only mode (assuming ClickHouse tables already exist)')
+        
+        # Set ClickHouse database - warn if it doesn't exist but don't fail
+        # (the user may be setting up or the database might be created later)
+        self.clickhouse_api.database = self.target_database
+        ch_databases = self.clickhouse_api.get_databases()
+        if self.target_database not in ch_databases:
+            logger.warning(
+                f"ClickHouse database '{self.target_database}' does not exist yet. "
+                f"Events for tables in this database will fail until the database is created."
+            )
+        
+        # Get list of tables from MySQL
+        self.state.tables = self.mysql_api.get_tables()
+        self.state.tables = [
+            table for table in self.state.tables if self.config.is_table_matches(table)
+        ]
+        logger.info(f'found {len(self.state.tables)} tables to track: {self.state.tables}')
+        
+        # Fetch table structures from MySQL (needed for record conversion)
+        # Only fetch for tables that exist in ClickHouse, skip others with a warning
+        ch_tables = []
+        if self.target_database in ch_databases:
+            ch_tables = self.clickhouse_api.get_tables()
+        
+        for table_name in self.state.tables:
+            target_table_name = self.get_target_table_name(table_name)
+            if target_table_name in ch_tables:
+                self._initialize_table_structure(table_name, check_ch_exists=False)
+            else:
+                logger.warning(
+                    f"ClickHouse table '{self.target_database}.{target_table_name}' does not exist. "
+                    f"Table structure will be loaded on-demand when events are received."
+                )
+        
+        # Set the starting position to current binlog position
+        last_transaction = self.data_reader.get_last_transaction_id()
+        if last_transaction is None:
+            logger.warning(
+                'No binlog data found. The binlog replicator may not have started yet. '
+                'Realtime replication will wait for new binlog data.'
+            )
+        self.state.last_processed_transaction = last_transaction
+        logger.info(f'starting from binlog position: {self.state.last_processed_transaction}')
+        
+    def _initialize_table_structure(self, table_name, check_ch_exists=True):
+        """
+        Fetch table structure from MySQL for record conversion.
+        
+        Args:
+            table_name: Name of the MySQL table
+            check_ch_exists: If True, verify ClickHouse table exists (default: True for backward compatibility)
+        """
+        logger.info(f'fetching structure for table: {table_name}')
+        
+        # Get MySQL table structure
+        mysql_create_statement = self.mysql_api.get_table_create_statement(table_name)
+        mysql_structure = self.converter.parse_mysql_table_structure(
+            mysql_create_statement, required_table_name=table_name,
+        )
+        
+        # Convert to ClickHouse structure (for record conversion, not table creation)
+        clickhouse_structure = self.converter.convert_table_structure(mysql_structure)
+        target_table_name = self.get_target_table_name(table_name)
+        clickhouse_structure.table_name = target_table_name
+        
+        # Optionally verify ClickHouse table exists
+        if check_ch_exists:
+            ch_tables = self.clickhouse_api.get_tables()
+            if target_table_name not in ch_tables:
+                raise Exception(
+                    f"ClickHouse table '{self.target_database}.{target_table_name}' does not exist. "
+                    f"Create the table first or run initial replication."
+                )
+        
+        # Store in state
+        self.state.tables_structure[table_name] = (mysql_structure, clickhouse_structure)
+        logger.info(f'table {table_name} structure loaded')
+
     def validate_database_settings(self):
         if not self.initial_only:
             final_setting = self.clickhouse_api.get_system_setting('final')
@@ -203,6 +291,19 @@ class DbReplicator:
         try:
             logger.info('launched db_replicator')
             self.validate_database_settings()
+
+            # Handle realtime_only mode - skip initial replication entirely
+            if self.realtime_only:
+                logger.info('realtime_only mode: skipping initial replication')
+                # Initialize state if it doesn't exist
+                if self.state.status == Status.NONE:
+                    logger.info('no existing state file, initializing for realtime-only mode')
+                    self._initialize_for_realtime_only()
+                # Force status to realtime replication
+                self.state.status = Status.RUNNING_REALTIME_REPLICATION
+                self.state.save()
+                self.run_realtime_replication()
+                return
 
             if self.state.status != Status.NONE:
                 # ensure target database still exists

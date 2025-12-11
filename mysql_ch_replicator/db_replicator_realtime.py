@@ -34,6 +34,59 @@ class DbReplicatorRealtime:
         self.last_dump_stats_process_time = 0
         self.last_records_upload_time = 0
         self.start_time = time.time()
+        self._tables_with_missing_structure = set()  # Track tables we've already warned about
+
+    def _ensure_table_structure(self, table_name):
+        """
+        Ensure table structure is loaded. If not, try to fetch it from MySQL on-demand.
+        Returns True if structure is available, False if it couldn't be loaded.
+        """
+        if table_name in self.replicator.state.tables_structure:
+            return True
+        
+        # Check if we've already warned about this table
+        if table_name in self._tables_with_missing_structure:
+            return False
+        
+        # Try to fetch the structure on-demand
+        logger.info(f'table structure for {table_name} not found, fetching from MySQL...')
+        
+        # Check if MySQL connection is available
+        if self.replicator.mysql_api is None:
+            logger.warning(
+                f'Cannot fetch table structure for {table_name}: MySQL connection not available. '
+                f'Skipping events for this table.'
+            )
+            self._tables_with_missing_structure.add(table_name)
+            return False
+        
+        try:
+            # Check if table exists in MySQL
+            mysql_tables = self.replicator.mysql_api.get_tables()
+            if table_name not in mysql_tables:
+                logger.warning(
+                    f'Table {table_name} does not exist in MySQL. Skipping events for this table.'
+                )
+                self._tables_with_missing_structure.add(table_name)
+                return False
+            
+            # Fetch structure (without ClickHouse existence check since we're in realtime mode)
+            self.replicator._initialize_table_structure(table_name, check_ch_exists=False)
+            
+            # Add to tracked tables if not already there
+            if table_name not in self.replicator.state.tables:
+                self.replicator.state.tables.append(table_name)
+            
+            logger.info(f'successfully loaded table structure for {table_name}')
+            return True
+            
+        except Exception as e:
+            logger.warning(
+                f'Failed to fetch table structure for {table_name}: {e}. '
+                f'Skipping events for this table.'
+            )
+            self._tables_with_missing_structure.add(table_name)
+            return False
 
     def run_realtime_replication(self):
         if self.replicator.initial_only:
@@ -41,10 +94,8 @@ class DbReplicatorRealtime:
             self.replicator.state.remove()
             return
 
-        # Close MySQL connection as it's not needed for realtime replication
-        if self.replicator.mysql_api:
-            self.replicator.mysql_api.close()
-            self.replicator.mysql_api = None
+        # Keep MySQL connection open - needed for lazy table structure loading in realtime_only mode
+        # Previously we closed it here, but now we need it for fetching table structures on-demand
             
         logger.info(f'running realtime replication from the position: {self.replicator.state.last_processed_transaction}')
         self.replicator.state.status = Status.RUNNING_REALTIME_REPLICATION
@@ -127,6 +178,12 @@ class DbReplicatorRealtime:
                 f'table: {event.table_name}, '
                 f'records: {event.records}',
             )
+        
+        # Ensure table structure is available (lazy loading)
+        if not self._ensure_table_structure(event.table_name):
+            logger.debug(f'skipping insert event for table {event.table_name}: structure not available')
+            return
+        
         self.replicator.stats.insert_events_count += 1
         self.replicator.stats.insert_records_count += len(event.records)
 
@@ -157,6 +214,11 @@ class DbReplicatorRealtime:
                     f'table: {event.table_name}, '
                     f'records: {len(event.records)}',
                 )
+            return
+        
+        # Ensure table structure is available (lazy loading)
+        if not self._ensure_table_structure(event.table_name):
+            logger.debug(f'skipping erase event for table {event.table_name}: structure not available')
             return
             
         self.replicator.stats.erase_events_count += 1
