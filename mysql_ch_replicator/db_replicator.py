@@ -63,6 +63,10 @@ class State:
 
     def save(self):
         file_name = self.file_name
+        # Ensure the directory exists before saving
+        dir_name = os.path.dirname(file_name)
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
         data = pickle.dumps({
             'last_processed_transaction': self.last_processed_transaction,
             'status': self.status.value,
@@ -232,15 +236,10 @@ class DbReplicator:
                     f"Table structure will be loaded on-demand when events are received."
                 )
         
-        # Set the starting position to current binlog position
-        last_transaction = self.data_reader.get_last_transaction_id()
-        if last_transaction is None:
-            logger.warning(
-                'No binlog data found. The binlog replicator may not have started yet. '
-                'Realtime replication will wait for new binlog data.'
-            )
-        self.state.last_processed_transaction = last_transaction
-        logger.info(f'starting from binlog position: {self.state.last_processed_transaction}')
+        # Start from the beginning of available binlog data to process any pending events
+        # Setting to None means DataReader will start from the first available binlog file
+        self.state.last_processed_transaction = None
+        logger.info('starting from the beginning of available binlog data')
         
     def _initialize_table_structure(self, table_name, check_ch_exists=True):
         """
